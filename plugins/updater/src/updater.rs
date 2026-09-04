@@ -129,19 +129,12 @@ impl RemoteRelease {
 pub type OnBeforeExit = Arc<dyn Fn() + Send + Sync + 'static>;
 pub type OnBeforeRequest = Arc<dyn Fn(ClientBuilder) -> ClientBuilder + Send + Sync + 'static>;
 pub type VersionComparator = Arc<dyn Fn(Version, RemoteRelease) -> bool + Send + Sync>;
-#[cfg(target_os = "macos")]
-type MainThreadClosure = Box<dyn FnOnce() + Send + Sync + 'static>;
-#[cfg(target_os = "macos")]
-type RunOnMainThread = Arc<dyn Fn(MainThreadClosure) -> tauri::Result<()> + Send + Sync + 'static>;
-
 // TODO: Move more fields to this in v3 if we can mark those fields non `pub`
 /// Updater context shared between [`UpdaterBuilder`], [`Updater`] and [`Update`]
 #[derive(Clone)]
 struct UpdaterContext {
     config: Config,
     configure_client: Option<OnBeforeRequest>,
-    #[cfg(target_os = "macos")]
-    run_on_main_thread: RunOnMainThread,
     /// App name, used for creating named tempfiles
     #[cfg(windows)]
     app_name: String,
@@ -170,11 +163,6 @@ pub struct UpdaterBuilder {
 
 impl UpdaterBuilder {
     pub(crate) fn new<R: Runtime>(app: &AppHandle<R>, config: crate::Config) -> Self {
-        #[cfg(target_os = "macos")]
-        let run_on_main_thread = {
-            let app_ = app.clone();
-            Arc::new(move |f| app_.run_on_main_thread(f))
-        };
         Self {
             context: UpdaterContext {
                 #[cfg(windows)]
@@ -185,8 +173,6 @@ impl UpdaterBuilder {
                     .unwrap_or_default(),
                 config,
                 configure_client: None,
-                #[cfg(target_os = "macos")]
-                run_on_main_thread,
                 #[cfg(windows)]
                 app_name: app.package_info().name.clone(),
                 #[cfg(windows)]
@@ -682,6 +668,27 @@ impl Update {
         mut on_chunk: C,
         on_download_finish: D,
     ) -> Result<Vec<u8>> {
+        let (response, content_length) = self.send_download_request().await?;
+
+        let mut buffer = Vec::new();
+
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            on_chunk(chunk.len(), content_length);
+            buffer.extend(chunk);
+        }
+        on_download_finish();
+
+        verify_signature(&buffer, &self.signature, &self.context.config.pubkey)?;
+
+        Ok(buffer)
+    }
+
+    /// Builds and sends the download request, returning the response and its
+    /// content length. Shared by [`Update::download`] and
+    /// [`Update::download_to_file`].
+    async fn send_download_request(&self) -> Result<(reqwest::Response, Option<u64>)> {
         // set our headers
         let mut headers = self.headers.clone();
         if !headers.contains_key(ACCEPT) {
@@ -727,19 +734,54 @@ impl Update {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok());
 
-        let mut buffer = Vec::new();
+        Ok((response, content_length))
+    }
 
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            on_chunk(chunk.len(), content_length);
-            buffer.extend(chunk);
+    /// Downloads the updater package to `dest` on disk, streaming chunks as
+    /// they arrive, then verifies the archive's signature.
+    ///
+    /// Unlike [`Update::download`] the archive is never kept in memory while
+    /// waiting for an install confirmation; the signature check reads the
+    /// finished file back once and drops the buffer immediately. On any
+    /// failure the partially written file is removed. Pass the verified path
+    /// to [`Update::install_from_file`] (macOS).
+    pub async fn download_to_file<C: FnMut(usize, Option<u64>), D: FnOnce()>(
+        &self,
+        dest: &Path,
+        mut on_chunk: C,
+        on_download_finish: D,
+    ) -> Result<()> {
+        let result = async {
+            let (response, content_length) = self.send_download_request().await?;
+
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Local disk writes are microsecond-scale; buffered std::io inside
+            // the async loop avoids a per-chunk blocking-task round trip.
+            let mut file = std::io::BufWriter::new(std::fs::File::create(dest)?);
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                std::io::Write::write_all(&mut file, &chunk)?;
+                on_chunk(chunk.len(), content_length);
+            }
+            std::io::Write::flush(&mut file)?;
+            drop(file);
+            on_download_finish();
+
+            // minisign verification needs the whole input; read the finished
+            // file back once and drop the buffer right after the check.
+            let buffer = std::fs::read(dest)?;
+            verify_signature(&buffer, &self.signature, &self.context.config.pubkey)?;
+            Ok(())
         }
-        on_download_finish();
+        .await;
 
-        verify_signature(&buffer, &self.signature, &self.context.config.pubkey)?;
-
-        Ok(buffer)
+        if result.is_err() {
+            std::fs::remove_file(dest).ok();
+        }
+        result
     }
 
     /// Installs the updater package downloaded by [`Update::download`]
@@ -1277,6 +1319,24 @@ impl Update {
 }
 
 /// MacOS
+/// Returns the on-volume staging directory used by the macOS installer to
+/// swap the installed app with a new version, e.g.
+/// `/Applications/.MyApp.app.update-staging`.
+///
+/// After a successful install the previous app bundle is parked at
+/// `<staging>/previous`; it is the crash-recovery copy and should only be
+/// removed by the caller once the new version has been confirmed running.
+#[cfg(target_os = "macos")]
+pub fn update_staging_dir_for(extract_path: &Path) -> Result<PathBuf> {
+    let parent = extract_path
+        .parent()
+        .ok_or(Error::FailedToDetermineExtractPath)?;
+    let name = extract_path
+        .file_name()
+        .ok_or(Error::FailedToDetermineExtractPath)?;
+    Ok(parent.join(format!(".{}.update-staging", name.to_string_lossy())))
+}
+
 #[cfg(target_os = "macos")]
 impl Update {
     /// ### Expected structure:
@@ -1286,92 +1346,123 @@ impl Update {
     /// │          └── ...
     /// └── ...
     fn install_inner(&self, bytes: &[u8]) -> Result<()> {
+        self.install_from_reader(Cursor::new(bytes))
+    }
+
+    /// Installs an update archive previously written to disk by
+    /// [`Update::download_to_file`], without loading it into memory.
+    pub fn install_from_file(&self, archive_path: &Path) -> Result<()> {
+        let file = std::fs::File::open(archive_path)?;
+        self.install_from_reader(std::io::BufReader::new(file))
+    }
+
+    /// The staging directory used by this update's installer; see
+    /// [`update_staging_dir_for`].
+    pub fn update_staging_dir(&self) -> Result<PathBuf> {
+        update_staging_dir_for(&self.extract_path)
+    }
+
+    /// Stages the new app next to the installed one, then atomically swaps
+    /// the two directories with `renamex_np(RENAME_SWAP)`.
+    ///
+    /// Crash safety: the installed app is never moved, removed or renamed
+    /// ahead of time. Either the swap succeeds — the target path holds the
+    /// new version and the previous version is parked in the staging
+    /// directory — or nothing happened to the installed app at all; a kill
+    /// or power loss at any instant leaves a complete launchable bundle at
+    /// the target path. Volumes without RENAME_SWAP support fail closed
+    /// instead of falling back to a non-atomic replace, and an unwritable
+    /// target directory aborts before anything is staged (no privilege
+    /// escalation is attempted).
+    fn install_from_reader<R: std::io::Read>(&self, reader: R) -> Result<()> {
         use flate2::read::GzDecoder;
+        use std::os::unix::ffi::OsStrExt;
 
-        let cursor = Cursor::new(bytes);
-        let mut extracted_files: Vec<PathBuf> = Vec::new();
-
-        // Create temp directories for backup and extraction
-        let tmp_backup_dir = tempfile::Builder::new()
-            .prefix("tauri_current_app")
-            .tempdir()?;
-
-        let tmp_extract_dir = tempfile::Builder::new()
-            .prefix("tauri_updated_app")
-            .tempdir()?;
-
-        let decoder = GzDecoder::new(cursor);
-        let mut archive = tar::Archive::new(decoder);
-
-        // Extract files to temporary directory
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let collected_path: PathBuf = entry.path()?.iter().skip(1).collect();
-            let extraction_path = tmp_extract_dir.path().join(&collected_path);
-
-            // Ensure parent directories exist
-            if let Some(parent) = extraction_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            if let Err(err) = entry.unpack(&extraction_path) {
-                // Cleanup on error
-                std::fs::remove_dir_all(tmp_extract_dir.path()).ok();
-                return Err(err.into());
-            }
-            extracted_files.push(extraction_path);
+        // Stage on the same volume as the installed app: the swap below
+        // requires both paths on one filesystem, and failing to create the
+        // staging directory means the target directory is not writable — in
+        // which case the update must not start at all.
+        let staging_root = update_staging_dir_for(&self.extract_path)?;
+        let new_app_dir = staging_root.join("new");
+        if new_app_dir.exists() {
+            std::fs::remove_dir_all(&new_app_dir)?;
         }
-
-        // Try to move the current app to backup
-        let move_result = std::fs::rename(
-            &self.extract_path,
-            tmp_backup_dir.path().join("current_app"),
-        );
-        let need_authorization = if let Err(err) = move_result {
+        std::fs::create_dir_all(&new_app_dir).map_err(|err| {
             if err.kind() == std::io::ErrorKind::PermissionDenied {
-                true
+                Error::TargetNotWritable
             } else {
-                std::fs::remove_dir_all(tmp_extract_dir.path()).ok();
-                return Err(err.into());
+                Error::Io(err)
             }
-        } else {
-            false
-        };
+        })?;
 
-        if need_authorization {
-            log::debug!("app installation needs admin privileges");
-            // Use AppleScript to perform moves with admin privileges
-            let apple_script = format!(
-                "do shell script \"rm -rf '{src}' && mv -f '{new}' '{src}'\" with administrator privileges",
-                src = self.extract_path.display(),
-                new = tmp_extract_dir.path().display()
-            );
-
-            let (tx, rx) = std::sync::mpsc::channel();
-            let res = (self.context.run_on_main_thread)(Box::new(move || {
-                let mut script =
-                    osakit::Script::new_from_source(osakit::Language::AppleScript, &apple_script);
-                script.compile().expect("invalid AppleScript");
-                let r = script.execute();
-                tx.send(r).unwrap();
-            }));
-            let result = rx.recv().unwrap();
-
-            if res.is_err() || result.is_err() {
-                std::fs::remove_dir_all(tmp_extract_dir.path()).ok();
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Failed to move the new app into place",
-                )));
+        let staged = (|| -> Result<()> {
+            let decoder = GzDecoder::new(reader);
+            let mut archive = tar::Archive::new(decoder);
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?;
+                // AppleDouble metadata entries (`._Foo`) must be skipped: a
+                // top-level `._MyApp.app` would collapse to an empty relative
+                // path after the strip below and clobber the staging root.
+                if path
+                    .file_name()
+                    .map(|n| n.as_encoded_bytes().starts_with(b"._"))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                // Strip the top-level `[AppName].app` component.
+                let collected_path: PathBuf = path.iter().skip(1).collect();
+                if collected_path.as_os_str().is_empty() {
+                    continue;
+                }
+                let extraction_path = new_app_dir.join(&collected_path);
+                if let Some(parent) = extraction_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                entry.unpack(&extraction_path)?;
             }
-        } else {
-            // Remove existing directory if it exists
-            if self.extract_path.exists() {
-                std::fs::remove_dir_all(&self.extract_path)?;
+            // The staged tree must look like an app bundle before it gets
+            // anywhere near the installed app.
+            if !new_app_dir.join("Contents").is_dir() {
+                return Err(Error::InvalidUpdaterFormat);
             }
-            // Move the new app to the target path
-            std::fs::rename(tmp_extract_dir.path(), &self.extract_path)?;
+            Ok(())
+        })();
+        if let Err(err) = staged {
+            std::fs::remove_dir_all(&new_app_dir).ok();
+            return Err(err);
         }
+
+        let nul_err =
+            |e: std::ffi::NulError| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
+        let new_c =
+            std::ffi::CString::new(new_app_dir.as_os_str().as_bytes()).map_err(nul_err)?;
+        let dst_c =
+            std::ffi::CString::new(self.extract_path.as_os_str().as_bytes()).map_err(nul_err)?;
+        // SAFETY: both CStrings outlive the call and renamex_np only reads
+        // the two paths.
+        let ret = unsafe { libc::renamex_np(new_c.as_ptr(), dst_c.as_ptr(), libc::RENAME_SWAP) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            std::fs::remove_dir_all(&new_app_dir).ok();
+            return Err(match err.raw_os_error() {
+                Some(libc::ENOTSUP) | Some(libc::EXDEV) | Some(libc::EINVAL) => {
+                    Error::AtomicSwapUnsupported
+                }
+                Some(libc::EACCES) | Some(libc::EPERM) => Error::TargetNotWritable,
+                _ => Error::Io(err),
+            });
+        }
+
+        // After the swap the staging "new" slot holds the previous version.
+        // Park it under a stable name for the caller to delete once the new
+        // version is confirmed running; a failed rename is harmless (the
+        // bundle simply stays in the "new" slot and is replaced on the next
+        // update).
+        let previous = staging_root.join("previous");
+        std::fs::remove_dir_all(&previous).ok();
+        std::fs::rename(&new_app_dir, &previous).ok();
 
         let _ = std::process::Command::new("touch")
             .arg(&self.extract_path)

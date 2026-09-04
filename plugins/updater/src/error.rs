@@ -89,6 +89,12 @@ pub enum Error {
     /// The configured updater endpoint must use a secure protocol like `https`
     #[error("The configured updater endpoint must use a secure protocol like `https`.")]
     InsecureTransportProtocol,
+    /// The volume holding the installed app cannot do an atomic directory swap.
+    #[error("the volume containing the installed app does not support an atomic rename swap; the installed app was left untouched — install the update manually")]
+    AtomicSwapUnsupported,
+    /// The directory containing the installed app is not writable.
+    #[error("the directory containing the installed app is not writable; the installed app was left untouched — install the update manually")]
+    TargetNotWritable,
     #[error(transparent)]
     Tauri(#[from] tauri::Error),
 }
