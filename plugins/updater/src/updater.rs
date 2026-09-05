@@ -784,6 +784,15 @@ impl Update {
         result
     }
 
+    /// Verifies that a previously downloaded archive on disk matches this
+    /// update's announced signature, so a relaunch can reuse it instead of
+    /// re-downloading. Reads the file back once; any mismatch surfaces as the
+    /// verification error.
+    pub fn verify_archive_file(&self, archive_path: &Path) -> Result<()> {
+        let data = std::fs::read(archive_path)?;
+        verify_signature(&data, &self.signature, &self.context.config.pubkey)
+    }
+
     /// Installs the updater package downloaded by [`Update::download`]
     ///
     /// ## Platform-specific:
